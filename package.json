@@ -1,0 +1,31 @@
+{
+  "name": "opencode-session-logger",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that logs completed session blocks (thinking, tool calls, messages, subtasks) to JSONL files",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "session-logger",
+    "ai-agent",
+    "observability"
+  ],
+  "author": "Utkarsh Pandey",
+  "license": "MIT",
+  "dependencies": {
+    "@opencode-ai/plugin": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}
