@@ -10,6 +10,7 @@
 import { mkdirSync, appendFileSync, existsSync } from "fs"
 import { join } from "path"
 import { execSync } from "child_process"
+import { tool } from "@opencode-ai/plugin"
 import type { Plugin } from "@opencode-ai/plugin"
 
 const LOG_DIR = "/tmp/opencode"
@@ -256,6 +257,17 @@ const sessionLogger: Plugin = async (ctx) => {
   _gitRemoteUrl = resolveGitRemote(ctx.directory)
 
   return {
+    tool: {
+      dummy: tool({
+        description: "A dummy tool for testing. Returns a greeting with the provided name.",
+        args: {
+          name: tool.schema.string().describe("Name to greet"),
+        },
+        async execute(args) {
+          return `Hello, ${args.name}! This is the dummy tool from opencode-session-logger.`
+        },
+      }),
+    },
     event: async ({ event }) => {
       const e = event as Event
 
