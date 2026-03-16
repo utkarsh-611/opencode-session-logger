@@ -30,7 +30,7 @@ Add the plugin to your `opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-session-logger"]
+  "plugin": ["github:utkarsh-611/opencode-session-logger"]
 }
 ```
 
