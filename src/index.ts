@@ -1,19 +1,20 @@
 /**
  * OpenCode Session Logger Plugin
  *
- * Logs completed blocks (thinking, tool calls, user messages, LLM text,
- * subtask spawns, step boundaries) to /tmp/opencode/session-<id>.jsonl
+ * Accumulates completed blocks (user message, thinking, LLM text, tool calls)
+ * per turn — including subagent events. When the main agent's LLM stops
+ * streaming, fires the full batch to localhost:4291.
+ * Fire-and-forget — does not wait for a response.
  *
- * Only logs when a block is DONE — no streaming deltas.
+ * Requires a git repo with a remote — silently drops events if no repo URL.
  */
 
-import { mkdirSync, appendFileSync, existsSync } from "fs"
+import { existsSync, appendFileSync } from "fs"
 import { join } from "path"
 import { execSync } from "child_process"
-import { tool } from "@opencode-ai/plugin"
 import type { Plugin } from "@opencode-ai/plugin"
 
-const LOG_DIR = "/tmp/opencode"
+const ENDPOINT = "http://localhost:4291"
 
 type Event = {
   type: string
@@ -35,75 +36,101 @@ type Message = {
   [key: string]: any
 }
 
-// Track which parts/messages we've already logged to avoid duplicates
-// (message.part.updated fires many times during streaming)
+// Deduplication
 const loggedParts = new Set<string>()
 const loggedMessages = new Set<string>()
 
-function ensureDir() {
-  try {
-    mkdirSync(LOG_DIR, { recursive: true })
-  } catch {}
-}
+// Single buffer — all events (main + subagent) accumulate here under the main session
+let mainBuffer: Record<string, any>[] = []
+let mainSessionID: string | undefined
+let turnStartTime: string | undefined
 
-function logFile(sessionID: string): string {
-  return join(LOG_DIR, `session-${sessionID}.jsonl`)
-}
+// Track agents and models used in this turn
+const agentsUsed = new Set<string>()
+const modelsUsed = new Set<string>()
 
-// Resolved once at plugin init
-let _gitRemoteUrl: string | undefined
+// Map subagent sessionID → parent sessionID
+const childToParent = new Map<string, string>()
+
+let _repoUrl: string | undefined
+let _enabled = false
 
 function resolveGitRemote(directory: string): string | undefined {
   try {
-    // Check if .git exists
     if (!existsSync(join(directory, ".git"))) return undefined
     const url = execSync("git remote get-url origin", { cwd: directory, timeout: 3000 })
-      .toString()
-      .trim()
+      .toString().trim()
     return url || undefined
-  } catch {
-    return undefined
-  }
+  } catch { return undefined }
 }
 
-function write(sessionID: string, entry: Record<string, any>) {
-  const line = JSON.stringify({
-    ts: new Date().toISOString(),
-    sessionID,
-    ...(_gitRemoteUrl && { gitRemote: _gitRemoteUrl }),
-    ...entry,
-  })
+function resolveCommitId(directory: string): string | undefined {
   try {
-    appendFileSync(logFile(sessionID), line + "\n")
-  } catch {
-    // silently ignore write errors
+    const hash = execSync("git rev-parse HEAD", { cwd: directory, timeout: 3000 })
+      .toString().trim()
+    return hash || undefined
+  } catch { return undefined }
+}
+
+function accumulate(entry: Record<string, any>) {
+  mainBuffer.push({ ts: new Date().toISOString(), ...entry })
+}
+
+function flushBuffer(directory: string) {
+  if (!mainSessionID || mainBuffer.length === 0 || !_repoUrl) return
+  const messages = mainBuffer
+  const sessionID = mainSessionID
+  const startTime = turnStartTime
+  mainBuffer = []
+
+  const commitId = resolveCommitId(directory)
+
+  const payload: Record<string, any> = {
+    sessionId: sessionID,
+    repoUrl: _repoUrl,
+    agentUsed: [...agentsUsed],
+    modelUsed: [...modelsUsed],
+    messages,
   }
+  if (startTime) payload.startTime = startTime
+  if (commitId) payload.commitId = commitId
+
+  // Fire and forget
+  fetch(ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).catch(() => {})
+
+  agentsUsed.clear()
+  modelsUsed.clear()
+}
+
+/** Resolve a sessionID to the root main session. */
+function resolveMain(sessionID: string): string {
+  let id = sessionID
+  while (childToParent.has(id)) id = childToParent.get(id)!
+  return id
+}
+
+/** Check if this sessionID belongs to the current main session tree. */
+function isMainTree(sessionID: string): boolean {
+  return mainSessionID !== undefined && resolveMain(sessionID) === mainSessionID
 }
 
 function isPartComplete(part: Part): boolean {
   switch (part.type) {
     case "text":
-      // User text parts have no time field (immediate). Assistant text has time.start/end (streamed).
-      // Complete when: no time field (user), or time.end is set (assistant finished streaming)
       return !part.time || !!part.time.end
     case "reasoning":
-      // Reasoning is complete when it has time.end set
       return !!part.time?.end
     case "tool":
-      // Tool is complete when state is "completed" or "error"
       return part.state?.status === "completed" || part.state?.status === "error"
     case "step-finish":
-      // Step finish parts are always "complete" on creation
-      return true
     case "step-start":
-      return true
     case "subtask":
-      // Subtask creation is a one-time event
-      return true
     case "agent":
-      return true
     case "retry":
-      return true
     case "compaction":
       return true
     default:
@@ -112,46 +139,39 @@ function isPartComplete(part: Part): boolean {
 }
 
 function formatPart(part: Part): Record<string, any> | null {
+  const isSubagent = part.sessionID !== mainSessionID
+
   switch (part.type) {
     case "text": {
-      // User text parts have no time field; assistant text parts have time.start/end
       const isUserText = !part.time
       return {
         kind: isUserText ? "user-text" : "llm-text",
-        partID: part.id,
-        messageID: part.messageID,
+        ...(isSubagent && { subagent: true }),
         text: part.text,
-        ...(part.synthetic && { synthetic: true }),
         ...(!isUserText && part.time?.end && part.time?.start && {
           duration: part.time.end - part.time.start,
         }),
       }
     }
-
     case "reasoning":
       return {
         kind: "thinking",
-        partID: part.id,
-        messageID: part.messageID,
+        ...(isSubagent && { subagent: true }),
         text: part.text,
         duration: part.time?.end && part.time?.start
           ? part.time.end - part.time.start
           : undefined,
       }
-
     case "tool": {
       const state = part.state
       if (state.status === "completed") {
         return {
           kind: "tool-call",
-          partID: part.id,
-          messageID: part.messageID,
+          ...(isSubagent && { subagent: true }),
           tool: part.tool,
-          callID: part.callID,
           status: "completed",
           input: state.input,
           output: truncate(state.output, 2000),
-          title: state.title,
           duration: state.time?.end && state.time?.start
             ? state.time.end - state.time.start
             : undefined,
@@ -160,10 +180,8 @@ function formatPart(part: Part): Record<string, any> | null {
       if (state.status === "error") {
         return {
           kind: "tool-call",
-          partID: part.id,
-          messageID: part.messageID,
+          ...(isSubagent && { subagent: true }),
           tool: part.tool,
-          callID: part.callID,
           status: "error",
           input: state.input,
           error: state.error,
@@ -174,75 +192,9 @@ function formatPart(part: Part): Record<string, any> | null {
       }
       return null
     }
-
-    case "step-finish":
-      return {
-        kind: "step-finish",
-        partID: part.id,
-        messageID: part.messageID,
-        reason: part.reason,
-        cost: part.cost,
-        tokens: part.tokens,
-      }
-
-    case "subtask":
-      return {
-        kind: "subtask",
-        partID: part.id,
-        messageID: part.messageID,
-        agent: part.agent,
-        description: part.description,
-        prompt: truncate(part.prompt, 500),
-      }
-
-    case "agent":
-      return {
-        kind: "agent-switch",
-        partID: part.id,
-        messageID: part.messageID,
-        agent: part.name,
-      }
-
-    case "retry":
-      return {
-        kind: "retry",
-        partID: part.id,
-        messageID: part.messageID,
-        attempt: part.attempt,
-        error: part.error,
-      }
-
     default:
       return null
   }
-}
-
-function formatMessage(msg: Message): Record<string, any> | null {
-  if (msg.role === "user") {
-    return {
-      kind: "user-message",
-      messageID: msg.id,
-      agent: msg.agent,
-      model: msg.model,
-      system: msg.system ? truncate(msg.system, 200) : undefined,
-    }
-  }
-
-  if (msg.role === "assistant" && msg.time?.completed) {
-    return {
-      kind: "assistant-done",
-      messageID: msg.id,
-      parentID: msg.parentID,
-      modelID: msg.modelID,
-      providerID: msg.providerID,
-      finish: msg.finish,
-      cost: msg.cost,
-      tokens: msg.tokens,
-      error: msg.error,
-    }
-  }
-
-  return null
 }
 
 function truncate(s: string | undefined, max: number): string | undefined {
@@ -253,36 +205,32 @@ function truncate(s: string | undefined, max: number): string | undefined {
 // ─── Plugin entry point ──────────────────────────────────────────────────────
 
 const sessionLogger: Plugin = async (ctx) => {
-  ensureDir()
-  _gitRemoteUrl = resolveGitRemote(ctx.directory)
+  _repoUrl = resolveGitRemote(ctx.directory)
+  _enabled = !!_repoUrl
 
   return {
-    tool: {
-      dummy: tool({
-        description: "A dummy tool for testing. Returns a greeting with the provided name.",
-        args: {
-          name: tool.schema.string().describe("Name to greet"),
-        },
-        async execute(args) {
-          return `Hello, ${args.name}! This is the dummy tool from opencode-session-logger.`
-        },
-      }),
-    },
     event: async ({ event }) => {
+      if (!_enabled) return
+
       const e = event as Event
 
-      // Log completed parts
+      // Track session hierarchy from session.created
+      if (e.type === "session.created") {
+        const info = e.properties.info as { id: string; parentID?: string }
+        if (info.parentID) {
+          childToParent.set(info.id, info.parentID)
+        }
+      }
+
+      // Completed parts → accumulate (main + subagent events into one buffer)
       if (e.type === "message.part.updated") {
         const part = e.properties.part as Part
         if (!part?.sessionID) return
-
-        // Only log when the part is actually complete
         if (!isPartComplete(part)) return
+        if (!isMainTree(part.sessionID)) return
 
-        // Deduplicate — we may see the same completed part multiple times
         const key = `${part.sessionID}:${part.id}:${part.type}`
         if (part.type === "tool") {
-          // For tools, include status in key since we get updates at each status
           const toolKey = `${key}:${part.state?.status}`
           if (loggedParts.has(toolKey)) return
           loggedParts.add(toolKey)
@@ -292,39 +240,38 @@ const sessionLogger: Plugin = async (ctx) => {
         }
 
         const entry = formatPart(part)
-        if (entry) write(part.sessionID, entry)
+        if (entry) accumulate(entry)
+
+        // Main session step-finish with stop/end_turn → flush everything
+        if (
+          part.type === "step-finish" &&
+          part.sessionID === mainSessionID &&
+          (part.reason === "stop" || part.reason === "end_turn")
+        ) {
+          flushBuffer(ctx.directory)
+        }
       }
 
-      // Log user messages (created) and assistant messages (completed)
+      // User message on main session → reset buffer for new turn
       if (e.type === "message.updated") {
         const msg = e.properties.info as Message
         if (!msg?.sessionID) return
 
-        if (msg.role === "user") {
+        // Track agents and models (extract string model name only)
+        if (msg.agent) agentsUsed.add(typeof msg.agent === "string" ? msg.agent : msg.agent.name ?? String(msg.agent))
+        const modelName = msg.modelID ?? (typeof msg.model === "string" ? msg.model : msg.model?.modelID)
+        if (modelName) modelsUsed.add(modelName)
+
+        if (msg.role === "user" && !childToParent.has(msg.sessionID)) {
           const key = `user:${msg.id}`
           if (loggedMessages.has(key)) return
           loggedMessages.add(key)
-          const entry = formatMessage(msg)
-          if (entry) write(msg.sessionID, entry)
-        }
 
-        if (msg.role === "assistant" && msg.time?.completed) {
-          const key = `assistant-done:${msg.id}`
-          if (loggedMessages.has(key)) return
-          loggedMessages.add(key)
-          const entry = formatMessage(msg)
-          if (entry) write(msg.sessionID, entry)
-        }
-      }
-
-      // Log session status changes
-      if (e.type === "session.status") {
-        const props = e.properties as { sessionID: string; status: any }
-        if (props.sessionID) {
-          write(props.sessionID, {
-            kind: "session-status",
-            status: props.status,
-          })
+          // Set/update main session
+          mainSessionID = msg.sessionID
+          mainBuffer = []
+          turnStartTime = new Date().toISOString()
+          accumulate({ kind: "user-message" })
         }
       }
     },
